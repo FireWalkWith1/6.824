@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"math/rand"
 	"sort"
 	"sync"
@@ -27,6 +28,7 @@ import (
 	"time"
 
 	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -121,6 +123,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -130,6 +139,7 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
+
 	// Your code here (2C).
 	// Example:
 	// r := bytes.NewBuffer(data)
@@ -143,6 +153,21 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []Log
+
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		panic("readPersist error")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 //
@@ -210,6 +235,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 		rf.state = "follower"
 		rf.votedFor = -1
+		rf.persist()
 	}
 	votedFor := rf.votedFor
 	lastLogIndex := len(rf.log) - 1
@@ -225,6 +251,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = true
 			rf.mu.Lock()
 			rf.votedFor = args.CandidateId
+			rf.persist()
 			rf.mu.Unlock()
 			rf.setLastTime()
 			// log.Printf("id=%v,votedFor=%v,term=%v", rf.me, rf.votedFor, currentTerm)
@@ -277,8 +304,9 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term        int
+	Success     bool
+	PreLogIndex int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -291,6 +319,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = rf.currentTerm
 		// log.Printf("args=%v,log=%v,term=%v,server=%v, reply=%v", args, rf.log, rf.currentTerm, rf.me, reply)
 		rf.mu.Unlock()
+		// log.Printf("sever %v recevie append entries from server %v, args=%v, reply=%v", rf.me, rf.leaderId, args, reply)
 		return
 	}
 	turn := false
@@ -298,6 +327,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		turn = true
 	}
 	rf.state = "follower"
+	if args.Term != rf.currentTerm {
+		rf.votedFor = -1
+	}
 	rf.currentTerm = args.Term
 	rf.leaderId = args.LeaderId
 	reply.Term = rf.currentTerm
@@ -343,8 +375,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					// log.Printf("应用到状态机后,server=%v", rf.me)
 				}
 			}
+		} else {
+			// 这个条件不会满足
+			if args.PreLogIndex == 0 {
+				reply.PreLogIndex = 0
+			} else {
+				var preLogIndex int
+				for preLogIndex = args.PreLogIndex - 1; preLogIndex >= 0; preLogIndex-- {
+					if rf.log[preLogIndex].Term != term {
+						break
+					}
+				}
+				reply.PreLogIndex = preLogIndex
+			}
 		}
+	} else {
+		reply.PreLogIndex = length - 1
 	}
+	rf.persist()
+	// log.Printf("sever %v recevie append entries from server %v, args=%v, reply=%v", rf.me, rf.leaderId, args, reply)
 	rf.mu.Unlock()
 	if turn {
 		rf.setTimeOut()
@@ -381,7 +430,6 @@ func (rf *Raft) syncAppendEntries(server int) {
 	}
 	args := AppendEntriesArgs{rf.currentTerm, rf.me, preLogIndex, preLogTerm, entries, rf.commitIndex}
 	rf.mu.Unlock()
-	// log.Printf("sever %v send append entries args=%v", rf.me, args)
 	reply := AppendEntriesReply{}
 	ok := rf.sendAppendEntries(server, &args, &reply)
 
@@ -391,6 +439,7 @@ func (rf *Raft) syncAppendEntries(server int) {
 		// log.Printf("send server=%v not ok", server)
 		return
 	}
+	// log.Printf("sever %v send append entries to server %v, args=%v, reply=%v", rf.me, server, args, reply)
 
 	// log.Printf("reply=%v,term=%v", reply, rf.currentTerm)
 	rf.mu.Lock()
@@ -399,8 +448,10 @@ func (rf *Raft) syncAppendEntries(server int) {
 		if rf.state != "follower" {
 			turn = true
 		}
+		rf.votedFor = -1
 		rf.state = "follower"
 		rf.currentTerm = reply.Term
+		rf.persist()
 		rf.mu.Unlock()
 		if turn {
 			rf.setTimeOut()
@@ -431,7 +482,9 @@ func (rf *Raft) syncAppendEntries(server int) {
 			go rf.syncAppendEntries(server)
 		}
 	} else {
-		rf.nextIndex[server]--
+		if reply.PreLogIndex+1 < rf.nextIndex[server] {
+			rf.nextIndex[server] = reply.PreLogIndex + 1
+		}
 		rf.mu.Unlock()
 		go rf.syncAppendEntries(server)
 	}
@@ -442,27 +495,30 @@ func (rf *Raft) updateCommitInfoOfLeader() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	matchIndice := make([]int, 0)
+	// 只提交当前任期的index
 	for index, matchIndex := range rf.matchIndex {
 		// log.Printf("rf=%v", rf)
-		if index != rf.me {
+		if index != rf.me && rf.log[matchIndex].Term == rf.currentTerm {
 			matchIndice = append(matchIndice, matchIndex)
 		}
 	}
-	sort.Sort(sort.Reverse(sort.IntSlice(matchIndice)))
-	// log.Printf("matchIndice=%v", matchIndice)
-	// log.Printf("majority=%v", rf.majority)
-	match := matchIndice[rf.majority-2]
-	// log.Printf("match=%v, commitIndex=%v", match, rf.commitIndex)
-	if match > rf.commitIndex {
-		rf.commitIndex = match
-		// log.Printf("server=%v, commitIndex=%v, lastApplied=%v", rf.me, rf.commitIndex, rf.lastApplied)
-		for rf.lastApplied < rf.commitIndex {
-			// 应用到状态机
-			rf.lastApplied++
-			msg := ApplyMsg{CommandValid: true, Command: rf.log[rf.lastApplied].Command, CommandIndex: rf.lastApplied}
-			// log.Printf("应用到状态机前,server=%v", rf.me)
-			rf.applyCh <- msg
-			// log.Printf("应用到状态机后,server=%v", rf.me)
+	if len(matchIndice) >= rf.majority-1 {
+		sort.Sort(sort.Reverse(sort.IntSlice(matchIndice)))
+		// log.Printf("matchIndice=%v", matchIndice)
+		// log.Printf("majority=%v", rf.majority)
+		match := matchIndice[rf.majority-2]
+		// log.Printf("match=%v, commitIndex=%v", match, rf.commitIndex)
+		if match > rf.commitIndex {
+			rf.commitIndex = match
+			// log.Printf("server=%v, commitIndex=%v, lastApplied=%v", rf.me, rf.commitIndex, rf.lastApplied)
+			for rf.lastApplied < rf.commitIndex {
+				// 应用到状态机
+				rf.lastApplied++
+				msg := ApplyMsg{CommandValid: true, Command: rf.log[rf.lastApplied].Command, CommandIndex: rf.lastApplied}
+				// log.Printf("应用到状态机前,server=%v", rf.me)
+				rf.applyCh <- msg
+				// log.Printf("应用到状态机后,server=%v", rf.me)
+			}
 		}
 	}
 }
@@ -496,6 +552,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		log := Log{term, command}
 		rf.log = append(rf.log, log)
 		index = len(rf.log) - 1
+		rf.persist()
 	}
 	rf.mu.Unlock()
 	if isLeader {
@@ -504,32 +561,32 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				go rf.syncAppendEntries(index)
 			}
 		}
-		times := 0
-		for {
-			rf.mu.Lock()
-			state := rf.state
-			isLeader = (state == "leader")
-			currentTerm := rf.currentTerm
-			commitIndex := rf.commitIndex
-			// log.Printf("server=%v, isLeader=%v, currentTerm=%v, term=%v", rf.me, isLeader, currentTerm, term)
-			rf.mu.Unlock()
-			if !isLeader || currentTerm != term {
-				term = currentTerm
-				index = -1
-				break
-			}
-			if times > 300 {
-				break
-			}
-			// log.Printf("commitIndex=%v, index=%v", commitIndex, index)
-			if commitIndex < index {
-				time.Sleep(time.Millisecond)
-				times++
-			} else {
-				break
-			}
+		// times := 0
+		// for {
+		// 	rf.mu.Lock()
+		// 	state := rf.state
+		// 	isLeader = (state == "leader")
+		// 	currentTerm := rf.currentTerm
+		// 	commitIndex := rf.commitIndex
+		// 	// log.Printf("server=%v, isLeader=%v, currentTerm=%v, term=%v", rf.me, isLeader, currentTerm, term)
+		// 	rf.mu.Unlock()
+		// 	if !isLeader || currentTerm != term {
+		// 		term = currentTerm
+		// 		index = -1
+		// 		break
+		// 	}
+		// 	if times > 5 {
+		// 		break
+		// 	}
+		// 	// log.Printf("commitIndex=%v, index=%v", commitIndex, index)
+		// 	if commitIndex < index {
+		// 		time.Sleep(time.Duration(200) * time.Millisecond)
+		// 		times++
+		// 	} else {
+		// 		break
+		// 	}
 
-		}
+		// }
 	}
 	// log.Printf("server=%v, index=%v, term=%v, isLeader=%v", rf.me, index, term, isLeader)
 	return index, term, isLeader
@@ -580,6 +637,7 @@ func (rf *Raft) ticker() {
 				rf.votedFor = -1
 				me := rf.me
 				currentTerm := rf.currentTerm
+				rf.persist()
 				rf.mu.Unlock()
 				rf.setTimeOut()
 				// 先为自己投票
@@ -613,7 +671,7 @@ func (rf *Raft) heartBeat() {
 				}
 			}
 		}
-		time.Sleep(time.Duration(50) * time.Millisecond)
+		time.Sleep(time.Duration(200) * time.Millisecond)
 	}
 }
 
@@ -630,6 +688,7 @@ func (rf *Raft) voteForMyself(currentTerm int) {
 	}
 	rf.voteForMe++
 	rf.votedFor = me
+	rf.persist()
 }
 
 func (rf *Raft) fireRqeuestVote(server int, currentTerm int) {
@@ -660,6 +719,8 @@ func (rf *Raft) fireRqeuestVote(server int, currentTerm int) {
 				turn = true
 			}
 			rf.state = "follower"
+			rf.votedFor = -1
+			rf.persist()
 			rf.mu.Unlock()
 			if turn {
 				rf.setTimeOut()
@@ -688,6 +749,8 @@ func (rf *Raft) fireRqeuestVote(server int, currentTerm int) {
 						rf.matchIndex[index] = 0
 					}
 				}
+				// 发送一个空消息(后面分析主从线性化)
+				// go rf.Start("EmptyCommand")
 			}
 		}
 
@@ -699,7 +762,7 @@ func (rf *Raft) fireRqeuestVote(server int, currentTerm int) {
 	}
 }
 func (rf *Raft) setTimeOut() {
-	random := getRandFloat64(300, 600)
+	random := getRandFloat64(2000, 3000)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.timeout = random
