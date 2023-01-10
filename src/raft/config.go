@@ -146,7 +146,6 @@ func (cfg *config) checkLogs(i int, m ApplyMsg) (string, bool) {
 	v := m.Command
 	for j := 0; j < len(cfg.logs); j++ {
 		if old, oldok := cfg.logs[j][m.CommandIndex]; oldok && old != v {
-			log.Printf("%v: log %v; server %v\n", i, cfg.logs[i], cfg.logs[j])
 			// some server has already committed a different value for this entry!
 			err_msg = fmt.Sprintf("commit index=%v server=%v %v != server=%v %v",
 				m.CommandIndex, i, m.Command, j, old)
@@ -320,15 +319,12 @@ func (cfg *config) start1(i int, applier func(int, chan ApplyMsg)) {
 	}
 
 	cfg.mu.Unlock()
-
 	applyCh := make(chan ApplyMsg)
 
 	rf := Make(ends, i, cfg.saved[i], applyCh)
-
 	cfg.mu.Lock()
 	cfg.rafts[i] = rf
 	cfg.mu.Unlock()
-
 	go applier(i, applyCh)
 
 	svc := labrpc.MakeService(rf)
@@ -506,7 +502,6 @@ func (cfg *config) nCommitted(index int) (int, interface{}) {
 
 		cfg.mu.Lock()
 		cmd1, ok := cfg.logs[i][index]
-		// log.Printf("cfg.logs[i]=%v", cfg.logs[i])
 		cfg.mu.Unlock()
 
 		if ok {
@@ -597,7 +592,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 				if nd > 0 && nd >= expectedServers {
 					// committed
 					if cmd1 == cmd {
-						// and it was the command we submitted.
+						// and it was the command we submitted.in start1
 						return index
 					}
 				}
