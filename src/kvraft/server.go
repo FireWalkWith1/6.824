@@ -1,12 +1,16 @@
 package kvraft
 
 import (
-	"6.824/labgob"
-	"6.824/labrpc"
-	"6.824/raft"
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"6.824/labgob"
+	"6.824/labrpc"
+	"6.824/raft"
+	"github.com/google/uuid"
 )
 
 const Debug = false
@@ -18,11 +22,15 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Op         string
+	Key        string
+	Value      string
+	Rand       int
+	ServerUUID string
 }
 
 type KVServer struct {
@@ -35,15 +43,111 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	kv             map[string]string
+	lastApplied    int
+	rand2timestamp map[int]int
+	chanMap        sync.Map
 }
 
+type apply struct {
+	ch    chan int
+	times time.Time
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	// log.Printf("server get begin")
+	serverUUID := uuid.NewString()
+	command := Op{"Get", args.Key, "", args.Rand, serverUUID}
+	ch := make(chan int, 1)
+	kv.chanMap.Store(serverUUID, apply{ch, time.Now()})
+	_, _, isLeader := kv.rf.Start(command)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		// log.Printf("server get end")
+		kv.chanMap.Delete(serverUUID)
+		return
+	}
+	isExecuted := false
+	// for i := 0; i < 20; i++ {
+	// 	isExecuted = kv.isExecute(index, args.Rand)
+	// 	if isExecuted {
+	// 		break
+	// 	}
+	// 	time.Sleep(time.Duration(10 * time.Millisecond))
+	// }
+	if _, ok := <-ch; ok {
+		isExecuted = true
+	}
+	if !isExecuted {
+		reply.Err = ErrExecute
+	} else {
+		kv.mu.Lock()
+		value, exist := kv.kv[args.Key]
+		kv.mu.Unlock()
+		if !exist {
+			reply.Err = ErrNoKey
+			reply.Value = ""
+		} else {
+			reply.Err = OK
+			reply.Value = value
+		}
+	}
+	kv.chanMap.Delete(serverUUID)
+	// log.Printf("server get end")
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	// log.Printf("server %v PutAppend begin, time %v, args %v", kv.me, time.Now(), args)
+	serverUUID := uuid.NewString()
+	command := Op{args.Op, args.Key, args.Value, args.Rand, serverUUID}
+	ch := make(chan int, 1)
+	kv.chanMap.Store(serverUUID, apply{ch, time.Now()})
+	_, _, isLeader := kv.rf.Start(command)
+	if !isLeader {
+		// log.Printf("server PutAppend end")
+		reply.Err = ErrWrongLeader
+		kv.chanMap.Delete(serverUUID)
+		return
+	}
+	isExecuted := false
+	// for i := 0; i < 20; i++ {
+	// 	isExecuted = kv.isExecute(index, args.Rand)
+	// 	if isExecuted {
+	// 		break
+	// 	}
+	// 	time.Sleep(time.Duration(10 * time.Millisecond))
+	// }
+	if _, ok := <-ch; ok {
+		isExecuted = true
+	}
+	if !isExecuted {
+		reply.Err = ErrExecute
+	} else {
+		reply.Err = OK
+	}
+	kv.chanMap.Delete(serverUUID)
+	// log.Printf("server %v PutAppend end, time %v, args %v", kv.me, time.Now(), args)
+}
+
+func (kv *KVServer) isExecute(index int, rand int) bool {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if kv.lastApplied < index {
+		return false
+	}
+	_, exist := kv.rand2timestamp[rand]
+	if exist {
+		return true
+	}
+	return false
+}
+
+func (kv *KVServer) GetState(args *GetStateArgs, reply *GetStateReply) {
+	term, isLeader := kv.rf.GetState()
+	reply.Term = term
+	reply.Isleader = isLeader
 }
 
 //
@@ -65,6 +169,121 @@ func (kv *KVServer) Kill() {
 func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
+}
+
+func (kv *KVServer) getLastApplied() int {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	return kv.lastApplied
+}
+
+// periodically snapshot raft state
+func (kv *KVServer) applierSnap() {
+	kv.mu.Lock()
+	applyCh := kv.applyCh
+	kv.mu.Unlock()
+	for m := range applyCh {
+		// log.Printf("server %v apply begin, time %v, args %v", kv.me, time.Now(), m)
+		// start := time.Now()
+		err_msg := ""
+		if m.SnapshotValid {
+
+		} else if m.CommandValid {
+			lastApplied := kv.getLastApplied()
+			// log.Printf("server %v message = %v", kv.me, m)
+			if m.CommandIndex != lastApplied+1 {
+				err_msg = fmt.Sprintf("server %v apply out of order, expected index %v, got %v", kv.me, lastApplied+1, m.CommandIndex)
+			}
+
+			kv.mu.Lock()
+			kv.lastApplied = m.CommandIndex
+			kv.mu.Unlock()
+			command := m.Command.(Op)
+			kv.execute(command)
+			v, ok := kv.chanMap.Load(command.ServerUUID)
+			if ok {
+				a := v.(apply)
+				a.ch <- 1
+			}
+			// if (m.CommandIndex+1)%SnapShotInterval == 0 {
+			// 	w := new(bytes.Buffer)
+			// 	e := labgob.NewEncoder(w)
+			// 	e.Encode(m.CommandIndex)
+			// 	var xlog []interface{}
+			// 	for j := 0; j <= m.CommandIndex; j++ {
+			// 		xlog = append(xlog, cfg.logs[i][j])
+			// 	}
+			// 	e.Encode(xlog)
+			// 	rf.Snapshot(m.CommandIndex, w.Bytes())
+			// }
+		} else {
+			// Ignore other types of ApplyMsg.
+		}
+		if err_msg != "" {
+			log.Fatalf("apply error: %v", err_msg)
+		}
+		// dur := time.Since(start)
+		// log.Printf("server %v apply end, time %v, args %v", kv.me, time.Now(), m)
+	}
+}
+
+func (kv *KVServer) execute(command Op) {
+	isExecuted := kv.isExecuted(command)
+	if !isExecuted {
+		if command.Op == "Put" {
+			kv.executePut(command)
+		} else if command.Op == "Append" {
+			kv.executeAppend(command)
+		}
+	}
+}
+
+func (kv *KVServer) executePut(command Op) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	kv.kv[command.Key] = command.Value
+}
+
+func (kv *KVServer) executeAppend(command Op) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	value, exist := kv.kv[command.Key]
+	if exist {
+		value = value + command.Value
+	} else {
+		value = command.Value
+	}
+	kv.kv[command.Key] = value
+}
+
+func (kv *KVServer) isExecuted(command Op) bool {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	rand := command.Rand
+	// start := time.Now()
+	_, executed := kv.rand2timestamp[rand]
+	// dur := time.Since(start)
+	// log.Printf("map cost %v", dur)
+	if !executed {
+		now := time.Now().Nanosecond()
+		kv.rand2timestamp[rand] = now
+		// log.Printf("server = %v, command = %v, map size %v", kv.me, command, len(kv.rand2timestamp))
+	}
+
+	return executed
+}
+func (kv *KVServer) channelExpire() {
+	for {
+		kv.chanMap.Range(func(key, value interface{}) bool {
+			a := value.(apply)
+			if time.Now().Sub(a.times) > time.Duration(200*time.Millisecond) {
+				close(a.ch)
+			}
+			return true
+		})
+		time.Sleep(time.Duration(10 * time.Millisecond))
+	}
+
 }
 
 //
@@ -91,11 +310,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
+	kv.kv = make(map[string]string)
+	kv.rand2timestamp = make(map[int]int)
+	kv.lastApplied = 0
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
-
+	go kv.applierSnap()
+	go kv.channelExpire()
 	return kv
 }

@@ -61,6 +61,7 @@ type ApplyMsg struct {
 type Raft struct {
 	mu        sync.Mutex // Lock to protect shared access to this peer's state
 	muApply   sync.Mutex
+	timeMu    sync.Mutex
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -91,7 +92,14 @@ type Raft struct {
 	majority  int       // 大多数
 	leaderId  int
 
-	applyCh chan ApplyMsg
+	applyCh     chan ApplyMsg
+	appendChs   []chan AppendMsg
+	appendTimes []time.Time
+}
+type AppendMsg struct {
+	types string // heartbeat log
+	index int
+	time  time.Time
 }
 
 type Log struct {
@@ -586,12 +594,12 @@ func (rf *Raft) sendInstallSnapshots(server int, args *InstallSnapshotsArgs, rep
 	return ok
 }
 
-func (rf *Raft) syncAppendEntries(server int) {
+func (rf *Raft) syncAppendEntries(server int) bool {
 	// log.Printf("server=%v syncAppendEntries...", rf.me)
 	rf.mu.Lock()
 	if rf.state != "leader" {
 		rf.mu.Unlock()
-		return
+		return false
 	}
 	nextIndex := rf.nextIndex[server]
 
@@ -605,7 +613,7 @@ func (rf *Raft) syncAppendEntries(server int) {
 		ok := rf.sendInstallSnapshots(server, &args, &reply)
 		// log.Printf("sever %v send install snapshots to server %v, args=%v, ok=%v, reply=%v", rf.me, server, args, ok, reply)
 		if !ok {
-			return
+			return false
 		}
 		rf.mu.Lock()
 		if reply.Term > rf.currentTerm {
@@ -621,11 +629,11 @@ func (rf *Raft) syncAppendEntries(server int) {
 			if turn {
 				rf.setTimeOut()
 			}
-			return
+			return false
 		}
 		if rf.state != "leader" {
 			rf.mu.Unlock()
-			return
+			return false
 		}
 
 		nextIndex = snapshotIndex + 1
@@ -639,7 +647,8 @@ func (rf *Raft) syncAppendEntries(server int) {
 		logLength := len(rf.log) + rf.snapshotIndex + 1
 		rf.mu.Unlock()
 		if nextIndex < logLength {
-			go rf.syncAppendEntries(server)
+			// go rf.syncAppendEntries(server)
+			rf.appendChs[server] <- AppendMsg{types: "log", index: nextIndex}
 		}
 		// log.Printf("send install snapshots finished...")
 	} else {
@@ -669,7 +678,7 @@ func (rf *Raft) syncAppendEntries(server int) {
 			// time.Sleep(time.Duration(3) * time.Millisecond)
 			// rf.syncAppendEntries(server)
 			// log.Printf("send server=%v not ok", server)
-			return
+			return false
 		}
 
 		// log.Printf("reply=%v,term=%v", reply, rf.currentTerm)
@@ -688,12 +697,12 @@ func (rf *Raft) syncAppendEntries(server int) {
 			if turn {
 				rf.setTimeOut()
 			}
-			return
+			return false
 		}
 
 		if rf.state != "leader" {
 			rf.mu.Unlock()
-			return
+			return false
 		}
 
 		if reply.Success {
@@ -712,7 +721,8 @@ func (rf *Raft) syncAppendEntries(server int) {
 				rf.updateCommitInfoOfLeader()
 			}
 			if nextIndex < logLength {
-				go rf.syncAppendEntries(server)
+				// go rf.syncAppendEntries(server)
+				rf.appendChs[server] <- AppendMsg{types: "log", index: nextIndex}
 			}
 		} else {
 			if reply.PreLogIndex+1 < rf.nextIndex[server] {
@@ -723,7 +733,7 @@ func (rf *Raft) syncAppendEntries(server int) {
 		}
 
 	}
-
+	return true
 }
 
 func (rf *Raft) updateCommitInfoOfLeader() {
@@ -806,9 +816,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	rf.mu.Unlock()
 	if isLeader {
-		for index := range rf.peers {
-			if index != rf.me {
-				go rf.syncAppendEntries(index)
+		for server := range rf.peers {
+			if server != rf.me {
+				// go rf.syncAppendEntries(server)
+				rf.appendChs[server] <- AppendMsg{types: "log", index: index}
 			}
 		}
 		// times := 0
@@ -914,14 +925,54 @@ func (rf *Raft) heartBeat() {
 		state := rf.state
 		rf.mu.Unlock()
 		if state == "leader" {
-			for index := range rf.peers {
+			for server := range rf.peers {
 				// log.Printf("rf=%v", rf)
-				if index != rf.me {
-					go rf.syncAppendEntries(index)
+				if server != rf.me {
+					rf.timeMu.Lock()
+					times := rf.appendTimes[server]
+					rf.timeMu.Unlock()
+					sub := time.Now().Sub(times)
+					if sub < time.Duration(60*time.Millisecond) {
+						time.Sleep(time.Duration(60*time.Millisecond) - sub)
+						continue
+					} else {
+						go rf.syncAppendEntries(server)
+					}
+
+					// rf.appendChs[server] <- AppendMsg{types: "heartbeat", time: time.Now()}
 				}
 			}
 		}
-		time.Sleep(time.Duration(200) * time.Millisecond)
+		time.Sleep(time.Duration(60 * time.Millisecond))
+	}
+}
+
+func (rf *Raft) recevieAppendCh(server int) {
+	// times := time.Now().Add(time.Duration(-11 * time.Millisecond))
+	for m := range rf.appendChs[server] {
+		// log.Printf("server %v msg=%v", server, m)
+		// if m.types == "heartbeat" {
+		// 	if time.Now().Sub(times) > time.Duration(10*time.Millisecond) {
+		// 		// log.Printf("server heart %v msg=%v", server, m)
+		// 		go rf.syncAppendEntries(server)
+		// 		times = time.Now()
+		// 	}
+
+		// } else
+		if m.types == "log" {
+			rf.mu.Lock()
+			matchIndex := rf.matchIndex[server]
+			rf.mu.Unlock()
+			if matchIndex < m.index {
+				success := rf.syncAppendEntries(server)
+				if success {
+					times := time.Now()
+					rf.timeMu.Lock()
+					rf.appendTimes[server] = times
+					rf.timeMu.Unlock()
+				}
+			}
+		}
 	}
 }
 
@@ -1019,7 +1070,7 @@ func (rf *Raft) fireRqeuestVote(server int, currentTerm int) {
 	}
 }
 func (rf *Raft) setTimeOut() {
-	random := getRandFloat64(2000, 3000)
+	random := getRandFloat64(600, 1000)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.timeout = random
@@ -1068,6 +1119,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.applyCh = applyCh
+	rf.appendChs = make([]chan AppendMsg, len(rf.peers))
+	rf.appendTimes = make([]time.Time, len(rf.peers))
+	for i := 0; i < len(rf.appendChs); i++ {
+		if i != rf.me {
+			rf.appendChs[i] = make(chan AppendMsg, 1000)
+		}
+	}
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	rf.snapshot = persister.ReadSnapshot()
@@ -1082,6 +1140,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.heartBeat()
-
+	times := time.Now().Add(time.Duration(-100 * time.Millisecond))
+	for i := 0; i < len(rf.appendChs); i++ {
+		if i != rf.me {
+			go rf.recevieAppendCh(i)
+			rf.appendTimes[i] = times
+		}
+	}
 	return rf
 }

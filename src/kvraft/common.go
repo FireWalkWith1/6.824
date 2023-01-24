@@ -1,9 +1,12 @@
 package kvraft
 
+import "sync"
+
 const (
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongLeader = "ErrWrongLeader"
+	ErrExecute     = "ErrExecute"
 )
 
 type Err string
@@ -16,6 +19,7 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Rand int
 }
 
 type PutAppendReply struct {
@@ -25,9 +29,27 @@ type PutAppendReply struct {
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
+	Rand int
 }
 
 type GetReply struct {
 	Err   Err
 	Value string
+}
+
+type GetStateArgs struct{}
+
+type GetStateReply struct {
+	Term     int
+	Isleader bool
+}
+
+var mu sync.Mutex
+var clientId int
+
+func getClientId() int {
+	mu.Lock()
+	defer mu.Unlock()
+	clientId++
+	return clientId << 50
 }
