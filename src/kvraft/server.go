@@ -1,7 +1,7 @@
 package kvraft
 
 import (
-	"fmt"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -26,7 +26,7 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Op         string
+	OpT        string
 	Key        string
 	Value      string
 	Rand       int
@@ -43,10 +43,9 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	kv             map[string]string
-	lastApplied    int
-	rand2timestamp map[int]int
-	chanMap        sync.Map
+	kv      map[string]string
+	randk   map[int]int8
+	chanMap sync.Map
 }
 
 type apply struct {
@@ -58,7 +57,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	// log.Printf("server get begin")
 	serverUUID := uuid.NewString()
-	command := Op{"Get", args.Key, "", args.Rand, serverUUID}
+	command := Op{"Get", args.Key, "", 0, serverUUID}
 	ch := make(chan int, 1)
 	kv.chanMap.Store(serverUUID, apply{ch, time.Now()})
 	_, _, isLeader := kv.rf.Start(command)
@@ -92,6 +91,33 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 			reply.Err = OK
 			reply.Value = value
 		}
+	}
+	kv.chanMap.Delete(serverUUID)
+	// log.Printf("server get end")
+}
+
+func (kv *KVServer) Ok(args *OkArgs, reply *OkReply) {
+	// Your code here.
+	// log.Printf("server get begin")
+	serverUUID := uuid.NewString()
+	command := Op{"Ok", "", "", args.Rand, serverUUID}
+	ch := make(chan int, 1)
+	kv.chanMap.Store(serverUUID, apply{ch, time.Now()})
+	_, _, isLeader := kv.rf.Start(command)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		// log.Printf("server get end")
+		kv.chanMap.Delete(serverUUID)
+		return
+	}
+	isExecuted := false
+	if _, ok := <-ch; ok {
+		isExecuted = true
+	}
+	if !isExecuted {
+		reply.Err = ErrExecute
+	} else {
+		reply.Err = OK
 	}
 	kv.chanMap.Delete(serverUUID)
 	// log.Printf("server get end")
@@ -131,19 +157,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// log.Printf("server %v PutAppend end, time %v, args %v", kv.me, time.Now(), args)
 }
 
-func (kv *KVServer) isExecute(index int, rand int) bool {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	if kv.lastApplied < index {
-		return false
-	}
-	_, exist := kv.rand2timestamp[rand]
-	if exist {
-		return true
-	}
-	return false
-}
-
 func (kv *KVServer) GetState(args *GetStateArgs, reply *GetStateReply) {
 	term, isLeader := kv.rf.GetState()
 	reply.Term = term
@@ -171,12 +184,6 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
-func (kv *KVServer) getLastApplied() int {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	return kv.lastApplied
-}
-
 // periodically snapshot raft state
 func (kv *KVServer) applierSnap() {
 	kv.mu.Lock()
@@ -185,42 +192,50 @@ func (kv *KVServer) applierSnap() {
 	for m := range applyCh {
 		// log.Printf("server %v apply begin, time %v, args %v", kv.me, time.Now(), m)
 		// start := time.Now()
-		err_msg := ""
 		if m.SnapshotValid {
-
-		} else if m.CommandValid {
-			lastApplied := kv.getLastApplied()
-			// log.Printf("server %v message = %v", kv.me, m)
-			if m.CommandIndex != lastApplied+1 {
-				err_msg = fmt.Sprintf("server %v apply out of order, expected index %v, got %v", kv.me, lastApplied+1, m.CommandIndex)
+			if m.Snapshot == nil || len(m.Snapshot) == 0 {
+				log.Fatalf("nil snapshot")
 			}
-
+			r := bytes.NewBuffer(m.Snapshot)
+			d := labgob.NewDecoder(r)
+			var kvs map[string]string
+			var rand2timestamp map[int]int8
+			if d.Decode(&kvs) != nil ||
+				d.Decode(&rand2timestamp) != nil {
+				log.Fatalf("snapshot decode error")
+			}
+			// log.Printf("server %v kvs=%v rand2timestam%v", kv.me, kvs, rand2timestamp)
 			kv.mu.Lock()
-			kv.lastApplied = m.CommandIndex
+			kv.kv = kvs
+			kv.randk = rand2timestamp
 			kv.mu.Unlock()
+		} else if m.CommandValid {
 			command := m.Command.(Op)
+
 			kv.execute(command)
+
 			v, ok := kv.chanMap.Load(command.ServerUUID)
 			if ok {
 				a := v.(apply)
 				a.ch <- 1
 			}
-			// if (m.CommandIndex+1)%SnapShotInterval == 0 {
-			// 	w := new(bytes.Buffer)
-			// 	e := labgob.NewEncoder(w)
-			// 	e.Encode(m.CommandIndex)
-			// 	var xlog []interface{}
-			// 	for j := 0; j <= m.CommandIndex; j++ {
-			// 		xlog = append(xlog, cfg.logs[i][j])
-			// 	}
-			// 	e.Encode(xlog)
-			// 	rf.Snapshot(m.CommandIndex, w.Bytes())
-			// }
+			kv.mu.Lock()
+			maxraftstate := kv.maxraftstate
+			kv.mu.Unlock()
+			if maxraftstate != -1 && kv.rf.RaftStateSize() > maxraftstate {
+				w := new(bytes.Buffer)
+				e := labgob.NewEncoder(w)
+				kv.mu.Lock()
+				keyvalue := kv.kv
+				rand2timestamp := kv.randk
+				kv.mu.Unlock()
+				e.Encode(keyvalue)
+				e.Encode(rand2timestamp)
+				kv.rf.Snapshot(m.CommandIndex, w.Bytes())
+			}
 		} else {
 			// Ignore other types of ApplyMsg.
-		}
-		if err_msg != "" {
-			log.Fatalf("apply error: %v", err_msg)
+			// log.Printf("else")
 		}
 		// dur := time.Since(start)
 		// log.Printf("server %v apply end, time %v, args %v", kv.me, time.Now(), m)
@@ -228,13 +243,19 @@ func (kv *KVServer) applierSnap() {
 }
 
 func (kv *KVServer) execute(command Op) {
-	isExecuted := kv.isExecuted(command)
-	if !isExecuted {
-		if command.Op == "Put" {
-			kv.executePut(command)
-		} else if command.Op == "Append" {
-			kv.executeAppend(command)
+	if command.OpT == "Put" || command.OpT == "Append" {
+		isExecuted := kv.isExecuted(command)
+		if !isExecuted {
+			if command.OpT == "Put" {
+				kv.executePut(command)
+			} else if command.OpT == "Append" {
+				kv.executeAppend(command)
+			}
 		}
+	} else if command.OpT == "Ok" {
+		kv.mu.Lock()
+		delete(kv.randk, command.Rand)
+		kv.mu.Unlock()
 	}
 }
 
@@ -261,17 +282,17 @@ func (kv *KVServer) isExecuted(command Op) bool {
 	defer kv.mu.Unlock()
 	rand := command.Rand
 	// start := time.Now()
-	_, executed := kv.rand2timestamp[rand]
+	_, executed := kv.randk[rand]
 	// dur := time.Since(start)
 	// log.Printf("map cost %v", dur)
 	if !executed {
-		now := time.Now().Nanosecond()
-		kv.rand2timestamp[rand] = now
+		kv.randk[rand] = 0
 		// log.Printf("server = %v, command = %v, map size %v", kv.me, command, len(kv.rand2timestamp))
 	}
 
 	return executed
 }
+
 func (kv *KVServer) channelExpire() {
 	for {
 		kv.chanMap.Range(func(key, value interface{}) bool {
@@ -311,12 +332,24 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.kv = make(map[string]string)
-	kv.rand2timestamp = make(map[int]int)
-	kv.lastApplied = 0
+	kv.randk = make(map[int]int8)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	snapshot := kv.rf.GetSnapshot()
+	if snapshot != nil && len(snapshot) > 0 {
+		r := bytes.NewBuffer(snapshot)
+		d := labgob.NewDecoder(r)
+		var kvs map[string]string
+		var rand2timestamp map[int]int8
+		if d.Decode(&kvs) != nil ||
+			d.Decode(&rand2timestamp) != nil {
+			log.Fatalf("snapshot decode error")
+		}
+		kv.kv = kvs
+		kv.randk = rand2timestamp
+	}
 	// You may need initialization code here.
 	go kv.applierSnap()
 	go kv.channelExpire()

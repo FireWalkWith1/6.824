@@ -26,10 +26,16 @@ type PutAppendReply struct {
 	Err Err
 }
 
+type OkArgs struct {
+	Rand int
+}
+
+type OkReply struct {
+	Err Err
+}
+
 type GetArgs struct {
 	Key string
-	// You'll have to add definitions here.
-	Rand int
 }
 
 type GetReply struct {

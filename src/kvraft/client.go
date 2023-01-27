@@ -65,7 +65,7 @@ func (ck *Clerk) Get(key string) string {
 		ck.leadId = leaderId
 	}
 	ck.mu.Unlock()
-	args := GetArgs{key, ck.getUUID()}
+	args := GetArgs{key}
 	reply := GetReply{}
 	for {
 		ok := ck.servers[leaderId].Call("KVServer.Get", &args, &reply)
@@ -102,7 +102,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	}
 	ck.mu.Unlock()
 	// start := time.Now()
-	args := PutAppendArgs{key, value, op, ck.getUUID()}
+	uuid := ck.getUUID()
+	args := PutAppendArgs{key, value, op, uuid}
 	// dur := time.Since(start)
 	// log.Printf("uuid cost %v", dur)
 	reply := PutAppendReply{}
@@ -110,6 +111,36 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		ok := ck.servers[leaderId].Call("KVServer.PutAppend", &args, &reply)
 		// log.Printf("client leadId = %v, PutAppend ok=%v, args=%v reply=%v", leaderId, ok, args, reply)
 		if !ok || !(reply.Err == OK || reply.Err == ErrNoKey) {
+			ck.mu.Lock()
+			leaderId = ck.getLeaderId(true)
+			ck.leadId = leaderId
+			ck.mu.Unlock()
+		} else {
+			go ck.Ok(uuid)
+			return
+		}
+	}
+}
+
+func (ck *Clerk) Ok(rand int) {
+	// You will have to modify this function.
+	// log.Printf("PutAppend...")
+	ck.mu.Lock()
+	leaderId := ck.leadId
+	if leaderId == -1 {
+		leaderId = ck.getLeaderId(true)
+		ck.leadId = leaderId
+	}
+	ck.mu.Unlock()
+	// start := time.Now()
+	args := OkArgs{rand}
+	// dur := time.Since(start)
+	// log.Printf("uuid cost %v", dur)
+	reply := OkReply{}
+	for {
+		ok := ck.servers[leaderId].Call("KVServer.Ok", &args, &reply)
+		// log.Printf("client leadId = %v, PutAppend ok=%v, args=%v reply=%v", leaderId, ok, args, reply)
+		if !ok || !(reply.Err == OK) {
 			ck.mu.Lock()
 			leaderId = ck.getLeaderId(true)
 			ck.leadId = leaderId

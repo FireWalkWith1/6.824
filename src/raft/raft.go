@@ -107,6 +107,16 @@ type Log struct {
 	Command interface{}
 }
 
+func (rf *Raft) RaftStateSize() int {
+	return rf.persister.RaftStateSize()
+}
+
+func (rf *Raft) GetSnapshot() []byte {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return clone(rf.snapshot)
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -552,7 +562,7 @@ func (rf *Raft) InstallSnapshots(args *InstallSnapshotsArgs, reply *InstallSnaps
 	}
 	snapshotIndex := rf.snapshotIndex
 	rf.snapshotIndex = args.LastIncludedIndex
-	rf.snapshotTerm = args.Term
+	rf.snapshotTerm = args.LastIncludedTerm
 
 	// 将snapshot复制
 	rf.snapshot = make([]byte, len(args.Data))
